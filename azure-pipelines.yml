@@ -1,0 +1,290 @@
+trigger:
+  branches:
+    include:
+      - main
+      - dev
+      - staging
+      - prod
+
+variables:
+  # Define variables for consistency across stages
+  imageName: 'my-spring-app'
+  ecrRepo: '$(awsAccountId).dkr.ecr.eu-west-1.amazonaws.com/my-spring-app'
+  imageTag: '$(Build.BuildId)'
+  cosignKey: '$(cosignPrivateKey)' # Stored securely in Azure DevOps variable group
+  helmChartPath: './helm/spring-app'
+
+stages:
+  # Build stage: Compile, build Docker image, scan, sign, and push to ECR
+  - stage: Build
+    displayName: 'Build and Push Image'
+    condition: succeeded() # Runs for all branches
+    jobs:
+      - job: BuildAndPush
+        displayName: 'Build, Scan, Sign, and Push'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          # Checkout the repository
+          - checkout: self
+            clean: true
+
+          # Install Java and Maven
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '17'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'PreInstalled'
+
+          # Build Spring Boot application
+          - script: |
+              mvn clean package -DskipTests
+            displayName: 'Maven Build'
+
+          - task: SonarQubePrepare@7
+            inputs:
+              SonarQube: 'sonarqube-service-connection'  # actual SonarQube service connection name
+              scannerMode: 'CLI'  # Or 'MSBuild' if using .NET
+              projectKey: 'sonarqube-project-key'  # From SonarQube project setup
+              projectName: 'secure-springboot-cicd-aws'  # Optional, project name
+            displayName: 'Prepare SonarQube'  # Moved to top-level
+
+          - task: SonarQubeAnalyze@7
+            displayName: 'Run SonarQube Analysis'
+
+          - task: SonarQubePublish@1
+            inputs:
+              pollingTimeoutSec: '300'  # Wait up to 5 minutes for quality gate
+            displayName: 'Publish SonarQube Results'
+
+          - task: DependencyCheckAnalyze@1
+            inputs:
+              dependencyCheckVersion: 'latest'  # Or specify a version
+              scanPath: '$(System.DefaultWorkingDirectory)'  # Path to scan
+              format: 'HTML'  # Output formats: HTML, JSON, XML, etc.
+              failOnCVSS: '7'  # Fail if vulnerabilities with CVSS score >=7 (critical/high)
+            displayName: 'OWASP Dependency-Check Scan'
+
+          # Set up Docker Buildx
+          - task: DockerInstaller@0
+            inputs:
+              dockerVersion: '20.10.17'
+
+          # Log in to AWS ECR
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: 'aws-service-connection'
+              regionName: 'eu-west-1'
+              scriptType: 'inline'
+              inlineScript: |
+                aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin $(awsAccountId).dkr.ecr.eu-west-1.amazonaws.com
+            displayName: 'Login to AWS ECR'
+
+          # Build and push Docker image
+          - task: Docker@2
+            inputs:
+              command: 'build'
+              Dockerfile: 'Dockerfile'
+              repository: '$(ecrRepo)'
+              tags: '$(imageTag)'
+              arguments: '--build-arg VERSION=$(imageTag)'
+            displayName: 'Build Docker Image'
+
+          # Install Trivy for security scanning
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+            displayName: 'Install Trivy'
+
+          # Scan image for critical vulnerabilities
+          - script: |
+              trivy image --severity CRITICAL --exit-code 1 $(ecrRepo):$(imageTag)
+            displayName: 'Trivy Security Scan'
+
+          # Install Cosign
+          - script: |
+              curl -sLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+              chmod +x cosign-linux-amd64
+              mv cosign-linux-amd64 /usr/local/bin/cosign
+            displayName: 'Install Cosign'
+
+          # Sign the image with Cosign
+          - script: |
+              echo "$cosignKey" > cosign.key
+              cosign sign --key cosign.key $(ecrRepo):$(imageTag)
+              rm cosign.key
+            displayName: 'Sign Image with Cosign'
+            env:
+              cosignPrivateKey: $(cosignKey)
+
+          # Push the image to ECR
+          - task: Docker@2
+            inputs:
+              command: 'push'
+              repository: '$(ecrRepo)'
+              tags: '$(imageTag)'
+            displayName: 'Push Image to ECR'
+
+  # Dev stage: Deploy to dev EKS namespace
+  - stage: Dev
+    displayName: 'Deploy to Dev'
+    dependsOn: Build
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/dev')
+    jobs:
+      - deployment: DeployDev
+        displayName: 'Deploy to Dev EKS'
+        environment: 'dev'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Verify image signature
+                - script: |
+                    curl -sLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+                    chmod +x cosign-linux-amd64
+                    mv cosign-linux-amd64 /usr/local/bin/cosign
+                    echo "$cosignKey" > cosign.key
+                    cosign verify --key cosign.key $(ecrRepo):$(imageTag)
+                    rm cosign.key
+                  displayName: 'Verify Image Signature'
+                  env:
+                    cosignPrivateKey: $(cosignKey)
+
+                # Configure kubectl for EKS
+                - task: AWSShellScript@1
+                  inputs:
+                    awsCredentials: 'aws-service-connection'
+                    regionName: 'eu-west-1'
+                    scriptType: 'inline'
+                    inlineScript: |
+                      aws eks update-kubeconfig --name dev-cluster --region eu-west-1
+                    displayName: 'Configure Kubectl for Dev EKS'
+
+                # Install Helm
+                - script: |
+                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                  displayName: 'Install Helm'
+
+                # Deploy to EKS using Helm
+                - task: HelmDeploy@0
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: 'eks-service-connection'
+                    namespace: 'dev'
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(helmChartPath)'
+                    releaseName: 'spring-app'
+                    arguments: '--install --set image.repository=$(ecrRepo) --set image.tag=$(imageTag)'
+                  displayName: 'Deploy to Dev EKS'
+
+  # Staging stage: Deploy to staging EKS with approval
+  - stage: Staging
+    displayName: 'Deploy to Staging'
+    dependsOn: Dev
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/staging')
+    jobs:
+      - deployment: DeployStaging
+        displayName: 'Deploy to Staging EKS'
+        environment: 'staging'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Verify image signature
+                - script: |
+                    curl -sLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+                    chmod +x cosign-linux-amd64
+                    mv cosign-linux-amd64 /usr/local/bin/cosign
+                    echo "$cosignKey" > cosign.key
+                    cosign verify --key cosign.key $(ecrRepo):$(imageTag)
+                    rm cosign.key
+                  displayName: 'Verify Image Signature'
+                  env:
+                    cosignPrivateKey: $(cosignKey)
+
+                # Configure kubectl for EKS
+                - task: AWSShellScript@1
+                  inputs:
+                    awsCredentials: 'aws-service-connection'
+                    regionName: 'eu-west-1'
+                    scriptType: 'inline'
+                    inlineScript: |
+                      aws eks update-kubeconfig --name staging-cluster --region eu-west-1
+                    displayName: 'Configure Kubectl for Staging EKS'
+
+                # Install Helm
+                - script: |
+                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                  displayName: 'Install Helm'
+
+                # Deploy to EKS using Helm
+                - task: HelmDeploy@0
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: 'eks-service-connection'
+                    namespace: 'staging'
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(helmChartPath)'
+                    releaseName: 'spring-app'
+                    arguments: '--install --set image.repository=$(ecrRepo) --set image.tag=$(imageTag)'
+                  displayName: 'Deploy to Staging EKS'
+
+  # Prod stage: Deploy to prod EKS with approval
+  - stage: Prod
+    displayName: 'Deploy to Prod'
+    dependsOn: Staging
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/prod')
+    jobs:
+      - deployment: DeployProd
+        displayName: 'Deploy to Prod EKS'
+        environment: 'prod'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Verify image signature
+                - script: |
+                    curl -sLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+                    chmod +x cosign-linux-amd64
+                    mv cosign-linux-amd64 /usr/local/bin/cosign
+                    echo "$cosignKey" > cosign.key
+                    cosign verify --key cosign.key $(ecrRepo):$(imageTag)
+                    rm cosign.key
+                  displayName: 'Verify Image Signature'
+                  env:
+                    cosignPrivateKey: $(cosignKey)
+
+                # Configure kubectl for EKS
+                - task: AWSShellScript@1
+                  inputs:
+                    awsCredentials: 'aws-service-connection'
+                    regionName: 'eu-west-1'
+                    scriptType: 'inline'
+                    inlineScript: |
+                      aws eks update-kubeconfig --name prod-cluster --region eu-west-1
+                    displayName: 'Configure Kubectl for Prod EKS'
+
+                # Install Helm
+                - script: |
+                    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+                  displayName: 'Install Helm'
+
+                # Deploy to EKS using Helm
+                - task: HelmDeploy@0
+                  inputs:
+                    connectionType: 'Kubernetes Service Connection'
+                    kubernetesServiceConnection: 'eks-service-connection'
+                    namespace: 'prod'
+                    command: 'upgrade'
+                    chartType: 'FilePath'
+                    chartPath: '$(helmChartPath)'
+                    releaseName: 'spring-app'
+                    arguments: '--install --set image.repository=$(ecrRepo) --set image.tag=$(imageTag)'
+                  displayName: 'Deploy to Prod EKS'
